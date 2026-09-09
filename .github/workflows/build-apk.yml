@@ -1,0 +1,137 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        required: true
+        type: string
+      build_mode:
+        description: "Build mode"
+        required: false
+        default: "release"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download project ZIP from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+
+          echo "Mencari release dengan tag: $TAG"
+
+          RELEASE_JSON=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+
+          echo "$RELEASE_JSON" > release.json
+
+          ASSET_URL=$(python3 - <<'PY'
+          import json
+          with open("release.json") as f:
+              data = json.load(f)
+
+          assets = data.get("assets", [])
+          if not assets:
+              raise SystemExit("Tidak ada asset ZIP pada release.")
+
+          asset = next(
+              (a for a in assets if a["name"].lower().endswith(".zip")),
+              assets[0]
+          )
+
+          print(asset["browser_download_url"])
+          PY
+          )
+
+          echo "Asset: $ASSET_URL"
+
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "$ASSET_URL" \
+            -o project.zip
+
+      - name: Extract project
+        run: |
+          set -e
+          mkdir project
+          unzip -q project.zip -d project
+
+          echo "Isi project:"
+          find project -maxdepth 2 -type f | head -100
+
+      - name: Detect Flutter project
+        run: |
+          set -e
+
+          if [ -f "project/pubspec.yaml" ]; then
+            echo "PROJECT_DIR=project" >> "$GITHUB_ENV"
+          else
+            DIR=$(find project -name pubspec.yaml -type f -print -quit | xargs -r dirname)
+
+            if [ -z "$DIR" ]; then
+              echo "pubspec.yaml tidak ditemukan."
+              exit 1
+            fi
+
+            echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ "${{ inputs.build_mode }}" = "debug" ]; then
+            flutter build apk --debug
+          elif [ "${{ inputs.build_mode }}" = "profile" ]; then
+            flutter build apk --profile
+          else
+            flutter build apk --release
+          fi
+
+      - name: Find APK
+        run: |
+          set -e
+
+          APK=$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+            -type f \
+            -name "*.apk" \
+            | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "APK tidak ditemukan."
+            exit 1
+          fi
+
+          echo "APK ditemukan: $APK"
+          cp "$APK" app-release.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-build
+          path: app-release.apk
+         
