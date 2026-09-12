@@ -11,7 +11,11 @@ on:
         description: "Build mode"
         required: false
         default: "release"
-        type: string
+        type: choice
+        options:
+          - release
+          - debug
+          - profile
 
 permissions:
   contents: read
@@ -19,119 +23,176 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-      - name: Download project ZIP from Release
+      - name: Download ZIP from Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Mencari release dengan tag: $TAG"
-
-          RELEASE_JSON=$(curl -fsSL \
+          curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            -o release.json
 
-          echo "$RELEASE_JSON" > release.json
-
-          ASSET_URL=$(python3 - <<'PY'
-          import json
-          with open("release.json") as f:
+          python3 - <<'PY'
+          import json, sys
+          with open("release.json", encoding="utf-8") as f:
               data = json.load(f)
 
-          assets = data.get("assets", [])
-          if not assets:
-              raise SystemExit("Tidak ada asset ZIP pada release.")
+          zips = [a for a in data.get("assets", [])
+                  if a.get("name", "").lower().endswith(".zip")]
 
-          asset = next(
-              (a for a in assets if a["name"].lower().endswith(".zip")),
-              assets[0]
-          )
+          if not zips:
+              raise SystemExit("ERROR: Release tidak memiliki asset .zip")
 
-          print(asset["browser_download_url"])
+          asset = zips[0]
+          print("ZIP:", asset["name"])
+          open("asset_url.txt", "w").write(asset["browser_download_url"])
           PY
-          )
-
-          echo "Asset: $ASSET_URL"
 
           curl -fL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
-            "$ASSET_URL" \
+            "$(cat asset_url.txt)" \
             -o project.zip
 
-      - name: Extract project
+      - name: Extract ZIP
         run: |
-          set -e
+          set -euo pipefail
+          rm -rf project
           mkdir project
           unzip -q project.zip -d project
 
-          echo "Isi project:"
-          find project -maxdepth 2 -type f | head -100
-
-      - name: Detect Flutter project
+      - name: Find Flutter project
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ -f "project/pubspec.yaml" ]; then
-            echo "PROJECT_DIR=project" >> "$GITHUB_ENV"
-          else
-            DIR=$(find project -name pubspec.yaml -type f -print -quit | xargs -r dirname)
+          PUBSPEC="$(find project -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' -print -quit)"
 
-            if [ -z "$DIR" ]; then
-              echo "pubspec.yaml tidak ditemukan."
-              exit 1
-            fi
-
-            echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan."
+            exit 1
           fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project: $PROJECT_DIR"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
-      - name: Flutter version
-        run: flutter --version
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-      - name: Flutter pub get
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+      - name: Prepare Android SDK
+        run: |
+          set -euo pipefail
 
-      - name: Build APK
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0" || true
+
+      - name: Repair CI local.properties
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          if [ "${{ inputs.build_mode }}" = "debug" ]; then
-            flutter build apk --debug
-          elif [ "${{ inputs.build_mode }}" = "profile" ]; then
-            flutter build apk --profile
+          set -euo pipefail
+
+          if [ -d android ]; then
+            printf 'sdk.dir=%s\nflutter.sdk=%s\n' \
+              "$ANDROID_HOME" \
+              "$FLUTTER_ROOT" > android/local.properties
           else
-            flutter build apk --release
-          fi
-
-      - name: Find APK
-        run: |
-          set -e
-
-          APK=$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
-            -type f \
-            -name "*.apk" \
-            | head -1)
-
-          if [ -z "$APK" ]; then
-            echo "APK tidak ditemukan."
+            echo "ERROR: folder android tidak ditemukan."
             exit 1
           fi
 
-          echo "APK ditemukan: $APK"
-          cp "$APK" app-release.apk
+      - name: Show project versions
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter --version
+          dart --version
 
-      - name: Upload APK Artifact
+          echo "=== Gradle wrapper ==="
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            grep -E 'distributionUrl=' \
+              android/gradle/wrapper/gradle-wrapper.properties || true
+          fi
+
+          echo "=== Android plugins ==="
+          grep -R -E \
+            'com.android.application.*version|com.android.tools.build:gradle|org.jetbrains.kotlin.android.*version' \
+            android --include='*.gradle' --include='*.gradle.kts' --include='settings.gradle*' \
+            || true
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: |
+          set -euo pipefail
+
+          flutter clean
+          flutter pub get
+
+          case "$BUILD_MODE" in
+            debug)
+              flutter build apk --debug
+              ;;
+            profile)
+              flutter build apk --profile
+              ;;
+            release)
+              flutter build apk --release
+              ;;
+            *)
+              echo "ERROR: build_mode tidak valid: $BUILD_MODE"
+              exit 1
+              ;;
+          esac
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+
+          APK="$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+            -type f -name '*.apk' -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan."
+            find "$PROJECT_DIR/build" -type f 2>/dev/null | head -200 || true
+            exit 1
+          fi
+
+          cp "$APK" app-release.apk
+          echo "APK berhasil ditemukan: $APK"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: apk-build
           path: app-release.apk
-         
+          if-no-files-found: error
+          retention-days: 7
